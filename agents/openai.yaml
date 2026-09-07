@@ -1,0 +1,7 @@
+interface:
+  display_name: "Lweb"
+  short_description: "One-line brief to full-stack industrial-premium export product"
+  brand_color: "#F26B2B"
+  default_prompt: "Use $lweb with this one-line brief to define and build the complete industrial-premium export product end to end: product definition, public frontend, searchable catalogue and detail routes, authenticated product surfaces when implied, real backend/API and persistence, authenticated admin operations, loading/empty/error/success/disabled states, responsive behavior, restrained motion, sanitization, and complete visual and functional QA."
+policy:
+  allow_implicit_invocation: true
