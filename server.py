@@ -131,7 +131,7 @@ class App(SimpleHTTPRequestHandler):
       if not self.guard(): return
       c=conn(); total=c.execute('select count(*) from inquiries').fetchone()[0]; queued=c.execute("select count(*) from outbox where state='queued'").fetchone()[0]; endpoint=c.execute("select value from settings where key='delivery_endpoint'").fetchone(); orders=c.execute('select count(*) from orders').fetchone()[0]; c.close(); return api(self,200,{'inquiries':total,'orders':orders,'queued':queued,'delivery':'configured' if endpoint else 'unconfigured','worker':'off'})
     # Public routes are client-rendered but must survive a direct load or refresh.
-    if p.path in ('/products','/cart','/checkout','/industries','/cases','/insights','/faq','/about','/admin') or p.path.startswith('/products/'):
+    if p.path in ('/products','/cart','/checkout','/quote','/industries','/cases','/insights','/faq','/about','/admin') or p.path.startswith('/products/'):
       self.path='/index.html'
     return super().do_GET()
   def rfq_multipart(self):
