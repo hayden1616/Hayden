@@ -37,3 +37,8 @@ For a production process manager, point it at `server.py`; terminate TLS at the 
 
 The server validates RFQs, applies per-IP limits, writes inquiry/outbox records in one SQLite transaction, uses signed HttpOnly SameSite cookies, checks origin and CSRF on mutations, and protects all admin APIs with an administrator session. No private connector address is included in public responses or assets.
 
+
+
+## Storefront phase one
+
+The public catalogue now supports maintained mock product data through `public/catalog-data.js`, product details, browser-backed cart, an order-request checkout (no payment capture), and an attachment-enabled RFQ form. The front-end data adapter is intentionally isolated so it can later be replaced by a commerce API such as Medusa without changing page components. Orders and RFQ metadata are stored in SQLite; attachments are held in `data/uploads/` and are not publicly served.
