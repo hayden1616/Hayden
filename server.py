@@ -79,6 +79,8 @@ def api(handler,status,payload,headers=None):
     raw=json.dumps(payload).encode(); handler.send_response(status); handler.send_header('Content-Type','application/json; charset=utf-8'); handler.send_header('Content-Length',str(len(raw))); handler.send_header('X-Content-Type-Options','nosniff'); handler.send_header('Cache-Control','no-store')
     for k,v in (headers or {}).items(): handler.send_header(k,v)
     handler.end_headers(); handler.wfile.write(raw)
+def text_response(handler,status,body,content_type='text/plain; charset=utf-8'):
+    raw=body.encode(); handler.send_response(status); handler.send_header('Content-Type',content_type); handler.send_header('Content-Length',str(len(raw))); handler.send_header('X-Content-Type-Options','nosniff'); handler.end_headers(); handler.wfile.write(raw)
 class App(SimpleHTTPRequestHandler):
   def __init__(self,*a,**kw): super().__init__(*a,directory=str(ROOT/'public'),**kw)
   def log_message(self,*a): pass
@@ -93,6 +95,9 @@ class App(SimpleHTTPRequestHandler):
   def do_GET(self):
     p=urlparse(self.path); q=parse_qs(p.query)
     if p.path=='/api/health': return api(self,200,{'status':'ready','database':'sqlite'})
+    if p.path=='/robots.txt': return text_response(self,200,f"User-agent: *\nAllow: /\nDisallow: /admin\nDisallow: /api/\nSitemap: {ORIGIN}/sitemap.xml\n")
+    if p.path=='/sitemap.xml':
+      c=conn(); slugs=[row['slug'] for row in c.execute('select slug from products where published=1 order by slug')]; c.close(); paths=['/','/products','/quote','/industries','/cases','/insights','/faq']+[f'/products/{slug}' for slug in slugs]; xml='<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'+''.join(f'<url><loc>{ORIGIN}{path}</loc></url>' for path in paths)+'</urlset>'; return text_response(self,200,xml,'application/xml; charset=utf-8')
     if p.path.startswith('/media/products/'):
       filename=p.path.rsplit('/',1)[1]; file_path=(MEDIA/filename).resolve()
       if not filename or Path(filename).name!=filename or file_path.parent!=MEDIA.resolve() or not file_path.is_file(): return api(self,404,{'error':'Image not found.'})
@@ -131,7 +136,7 @@ class App(SimpleHTTPRequestHandler):
       if not self.guard(): return
       c=conn(); total=c.execute('select count(*) from inquiries').fetchone()[0]; queued=c.execute("select count(*) from outbox where state='queued'").fetchone()[0]; endpoint=c.execute("select value from settings where key='delivery_endpoint'").fetchone(); orders=c.execute('select count(*) from orders').fetchone()[0]; c.close(); return api(self,200,{'inquiries':total,'orders':orders,'queued':queued,'delivery':'configured' if endpoint else 'unconfigured','worker':'off'})
     # Public routes are client-rendered but must survive a direct load or refresh.
-    if p.path in ('/products','/cart','/checkout','/quote','/industries','/cases','/insights','/faq','/about','/admin') or p.path.startswith('/products/'):
+    if p.path in ('/products','/cart','/checkout','/order-confirmation','/quote','/industries','/cases','/insights','/faq','/about','/admin') or p.path.startswith('/products/'):
       self.path='/index.html'
     return super().do_GET()
   def rfq_multipart(self):
@@ -189,7 +194,7 @@ class App(SimpleHTTPRequestHandler):
        c.execute('insert into orders(reference,email,name,company,phone,country,address_line1,address_line2,city,region,postal_code,notes,items_json,total_cents) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(ref,str(customer['email'])[:200],str(customer['name'])[:160],str(customer.get('company',''))[:200],str(customer['phone'])[:80],str(customer['country'])[:100],str(customer['address_line1'])[:250],str(customer.get('address_line2',''))[:250],str(customer['city'])[:120],str(customer.get('region',''))[:120],str(customer['postal_code'])[:40],str(customer.get('notes',''))[:1000],json.dumps(priced_items),total)); c.commit()
       except Exception: c.rollback(); return api(self,500,{'error':'We could not create this order. Please try again.'})
       finally: c.close()
-      return api(self,201,{'reference':ref,'status':'pending_payment','message':'Order request received. Payment is not configured yet; our team will confirm next steps.'})
+      return api(self,201,{'reference':ref,'status':'pending_payment','total_cents':total,'currency':'USD','message':'Order request received. Payment is not configured yet; our team will confirm next steps.'})
     if p=='/api/login':
       c=conn(); u=c.execute('select * from users where email=?',(str(data.get('email','')).lower(),)).fetchone(); c.close()
       if not u or not verify(str(data.get('password','')),u['password']): return api(self,401,{'error':'Invalid email or password'})
