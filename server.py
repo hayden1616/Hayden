@@ -1,4 +1,4 @@
-import base64, hashlib, hmac, json, os, secrets, sqlite3, time, uuid
+import base64, hashlib, hmac, json, mimetypes, os, secrets, sqlite3, time, uuid
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
@@ -57,6 +57,9 @@ def init():
     if added:
      for slug,meta in COMMERCE.items(): c.execute("update products set price_cents=?,inventory=?,sku=?,currency='USD' where slug=?",(meta['price_cents'],meta['inventory'],meta['sku'],slug))
     c.execute('create unique index if not exists idx_products_sku on products(sku) where sku is not null')
+    order_columns={row['name'] for row in c.execute('pragma table_info(orders)')}
+    for name,definition in [('country',"TEXT NOT NULL DEFAULT ''"),('address_line1',"TEXT NOT NULL DEFAULT ''"),('address_line2',"TEXT NOT NULL DEFAULT ''"),('city',"TEXT NOT NULL DEFAULT ''"),('region',"TEXT NOT NULL DEFAULT ''"),('postal_code',"TEXT NOT NULL DEFAULT ''"),('notes',"TEXT NOT NULL DEFAULT ''")]:
+     if name not in order_columns: c.execute(f'alter table orders add column {name} {definition}')
     c.commit(); c.close()
 init()
 def sign(v): return base64.urlsafe_b64encode(hmac.new(SECRET,v.encode(),hashlib.sha256).digest()).decode().rstrip('=')
@@ -93,15 +96,27 @@ class App(SimpleHTTPRequestHandler):
       c=conn(); x=c.execute('select * from products where slug=? and published=1',(p.path.rsplit('/',1)[1],)).fetchone(); c.close(); return api(self,200,{'product':enrich_product(x) if x else None})
     if p.path=='/api/session':
       s=session(self); return api(self,200,{'authenticated':bool(s),'email':s.get('email') if s else None,'csrf':s.get('csrf') if s else None})
+    if p.path.startswith('/api/admin/attachments/'):
+      if not self.guard(): return
+      try: attachment_id=int(p.path.rsplit('/',1)[1])
+      except ValueError: return api(self,404,{'error':'Attachment not found.'})
+      c=conn(); record=c.execute('select filename,stored_name,content_type,size from rfq_attachments where id=?',(attachment_id,)).fetchone(); c.close()
+      if not record: return api(self,404,{'error':'Attachment not found.'})
+      file_path=(UPLOADS/record['stored_name']).resolve()
+      if file_path.parent!=UPLOADS.resolve() or not file_path.is_file(): return api(self,404,{'error':'Attachment file is unavailable.'})
+      raw=file_path.read_bytes(); self.send_response(200); self.send_header('Content-Type',mimetypes.guess_type(record['filename'])[0] or 'application/octet-stream'); self.send_header('Content-Length',str(len(raw))); self.send_header('Content-Disposition',f"attachment; filename=\"{record['filename']}\""); self.send_header('X-Content-Type-Options','nosniff'); self.send_header('Cache-Control','private, no-store'); self.end_headers(); self.wfile.write(raw); return
     if p.path=='/api/admin/orders':
       if not self.guard(): return
       c=conn(); rows=[]
-      for x in c.execute('select id,reference,name,email,company,phone,items_json,total_cents,currency,status,created_at from orders order by id desc'):
+      for x in c.execute('select id,reference,name,email,company,phone,country,address_line1,address_line2,city,region,postal_code,notes,items_json,total_cents,currency,status,created_at from orders order by id desc'):
        d=dict(x); d['items']=json.loads(d.pop('items_json')); rows.append(d)
       c.close(); return api(self,200,{'orders':rows})
     if p.path=='/api/admin/inquiries':
       if not self.guard(): return
-      term=q.get('q',[''])[0].lower(); c=conn(); rows=[dict(x) for x in c.execute('select i.id,i.reference,i.name,i.email,i.company,i.phone,i.product,i.message,i.state,i.created_at,count(a.id) attachment_count from inquiries i left join rfq_attachments a on a.inquiry_id=i.id group by i.id order by i.id desc')]; c.close(); rows=[x for x in rows if term in json.dumps(x).lower()]; return api(self,200,{'inquiries':rows})
+      term=q.get('q',[''])[0].lower(); c=conn(); rows=[]
+      for x in c.execute('select id,reference,name,email,company,phone,product,message,state,created_at from inquiries order by id desc'):
+       d=dict(x); d['attachments']=[dict(a) for a in c.execute('select id,filename,size from rfq_attachments where inquiry_id=? order by id',(d['id'],))]; d['attachment_count']=len(d['attachments']); rows.append(d)
+      c.close(); rows=[x for x in rows if term in json.dumps(x).lower()]; return api(self,200,{'inquiries':rows})
     if p.path=='/api/admin/products':
       if not self.guard(): return
       c=conn(); rows=[dict(x) for x in c.execute('select * from products order by model')]; c.close(); return api(self,200,{'products':rows})
@@ -145,12 +160,12 @@ class App(SimpleHTTPRequestHandler):
     data=self.body()
     if p=='/api/orders':
       items=data.get('items',[]); customer=data.get('customer',{})
-      if not items or not customer.get('name') or '@' not in str(customer.get('email','')): return api(self,422,{'error':'Add at least one item and complete your name and email.'})
+      if not items or not customer.get('name') or '@' not in str(customer.get('email','')) or any(not str(customer.get(k,'')).strip() for k in ('phone','country','address_line1','city','postal_code')): return api(self,422,{'error':'Complete contact and shipping information.'})
       try: priced_items,total=price_order(items)
       except (ValueError,TypeError): return api(self,422,{'error':'A product is unavailable or its quantity is invalid.'})
       ref='ORD-'+secrets.token_hex(4).upper(); c=conn()
       try:
-       c.execute('insert into orders(reference,email,name,company,phone,items_json,total_cents) values(?,?,?,?,?,?,?)',(ref,str(customer['email'])[:200],str(customer['name'])[:160],str(customer.get('company',''))[:200],str(customer.get('phone',''))[:80],json.dumps(priced_items),total)); c.commit()
+       c.execute('insert into orders(reference,email,name,company,phone,country,address_line1,address_line2,city,region,postal_code,notes,items_json,total_cents) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(ref,str(customer['email'])[:200],str(customer['name'])[:160],str(customer.get('company',''))[:200],str(customer['phone'])[:80],str(customer['country'])[:100],str(customer['address_line1'])[:250],str(customer.get('address_line2',''))[:250],str(customer['city'])[:120],str(customer.get('region',''))[:120],str(customer['postal_code'])[:40],str(customer.get('notes',''))[:1000],json.dumps(priced_items),total)); c.commit()
       except Exception: c.rollback(); return api(self,500,{'error':'We could not create this order. Please try again.'})
       finally: c.close()
       return api(self,201,{'reference':ref,'status':'pending_payment','message':'Order request received. Payment is not configured yet; our team will confirm next steps.'})
