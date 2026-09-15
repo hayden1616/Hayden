@@ -21,6 +21,24 @@ PRODUCTS=[
 ('ana-410','ANA-410','Process Analysis','Conductivity analyser with temperature compensation.','Analysis','0–200 mS/cm','4–20 mA / Ethernet','IP65'),
 ('ctl-510','CTL-510','Control','Panel controller for mixed-signal process automation.','Control','24 VDC','Modbus TCP / RTU','IP20'),
 ('int-620','INT-620','Integration','Protocol gateway for legacy field devices and PLC networks.','Integration','-20–70 °C','EtherNet/IP / Modbus','IP30')]
+COMMERCE={
+ 'trm-100':{'price_cents':18900,'inventory':24,'sku':'TRM-100-STD'},
+ 'lsg-210':{'price_cents':23900,'inventory':18,'sku':'LSG-210-STD'},
+ 'wcn-320':{'price_cents':31500,'inventory':12,'sku':'WCN-320-STD'},
+ 'ana-410':{'price_cents':27900,'inventory':16,'sku':'ANA-410-STD'},
+ 'ctl-510':{'price_cents':34900,'inventory':9,'sku':'CTL-510-STD'},
+ 'int-620':{'price_cents':21900,'inventory':21,'sku':'INT-620-STD'}
+}
+def enrich_product(row):
+ d=dict(row); d.update(COMMERCE.get(d['slug'],{'price_cents':0,'inventory':0,'sku':d['model']})); d['currency']='USD'; return d
+def price_order(items):
+ if not isinstance(items,list) or not items: raise ValueError('Add at least one item.')
+ priced=[]; total=0
+ for item in items:
+  slug=str(item.get('slug','')); product=COMMERCE.get(slug); quantity=max(1,min(99,int(item.get('quantity',1))))
+  if not product or quantity>product['inventory']: raise ValueError('A product is unavailable or exceeds available quantity.')
+  priced.append({'slug':slug,'model':product['sku'].removesuffix('-STD'),'title':product['sku'],'quantity':quantity,'unit_price_cents':product['price_cents']}); total+=product['price_cents']*quantity
+ return priced,total
 def conn():
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
 def hash_pw(p):
@@ -61,20 +79,26 @@ class App(SimpleHTTPRequestHandler):
     p=urlparse(self.path); q=parse_qs(p.query)
     if p.path=='/api/health': return api(self,200,{'status':'ready','database':'sqlite'})
     if p.path=='/api/products':
-      c=conn(); rows=[dict(x) for x in c.execute('select * from products where published=1 order by model')]; c.close(); return api(self,200,{'products':rows})
+      c=conn(); rows=[enrich_product(x) for x in c.execute('select * from products where published=1 order by model')]; c.close(); return api(self,200,{'products':rows})
     if p.path.startswith('/api/products/'):
-      c=conn(); x=c.execute('select * from products where slug=? and published=1',(p.path.rsplit('/',1)[1],)).fetchone(); c.close(); return api(self,200,{'product':dict(x) if x else None})
+      c=conn(); x=c.execute('select * from products where slug=? and published=1',(p.path.rsplit('/',1)[1],)).fetchone(); c.close(); return api(self,200,{'product':enrich_product(x) if x else None})
     if p.path=='/api/session':
       s=session(self); return api(self,200,{'authenticated':bool(s),'email':s.get('email') if s else None,'csrf':s.get('csrf') if s else None})
+    if p.path=='/api/admin/orders':
+      if not self.guard(): return
+      c=conn(); rows=[]
+      for x in c.execute('select id,reference,name,email,company,phone,items_json,total_cents,currency,status,created_at from orders order by id desc'):
+       d=dict(x); d['items']=json.loads(d.pop('items_json')); rows.append(d)
+      c.close(); return api(self,200,{'orders':rows})
     if p.path=='/api/admin/inquiries':
       if not self.guard(): return
-      term=q.get('q',[''])[0].lower(); c=conn(); rows=[dict(x) for x in c.execute('select id,reference,name,email,company,product,state,created_at from inquiries order by id desc')]; c.close(); rows=[x for x in rows if term in json.dumps(x).lower()]; return api(self,200,{'inquiries':rows})
+      term=q.get('q',[''])[0].lower(); c=conn(); rows=[dict(x) for x in c.execute('select i.id,i.reference,i.name,i.email,i.company,i.phone,i.product,i.message,i.state,i.created_at,count(a.id) attachment_count from inquiries i left join rfq_attachments a on a.inquiry_id=i.id group by i.id order by i.id desc')]; c.close(); rows=[x for x in rows if term in json.dumps(x).lower()]; return api(self,200,{'inquiries':rows})
     if p.path=='/api/admin/products':
       if not self.guard(): return
       c=conn(); rows=[dict(x) for x in c.execute('select * from products order by model')]; c.close(); return api(self,200,{'products':rows})
     if p.path=='/api/admin/status':
       if not self.guard(): return
-      c=conn(); total=c.execute('select count(*) from inquiries').fetchone()[0]; queued=c.execute("select count(*) from outbox where state='queued'").fetchone()[0]; endpoint=c.execute("select value from settings where key='delivery_endpoint'").fetchone(); c.close(); return api(self,200,{'inquiries':total,'queued':queued,'delivery':'configured' if endpoint else 'unconfigured','worker':'off'})
+      c=conn(); total=c.execute('select count(*) from inquiries').fetchone()[0]; queued=c.execute("select count(*) from outbox where state='queued'").fetchone()[0]; endpoint=c.execute("select value from settings where key='delivery_endpoint'").fetchone(); orders=c.execute('select count(*) from orders').fetchone()[0]; c.close(); return api(self,200,{'inquiries':total,'orders':orders,'queued':queued,'delivery':'configured' if endpoint else 'unconfigured','worker':'off'})
     # Public routes are client-rendered but must survive a direct load or refresh.
     if p.path in ('/products','/cart','/checkout','/industries','/cases','/insights','/faq','/about','/admin') or p.path.startswith('/products/'):
       self.path='/index.html'
@@ -113,11 +137,11 @@ class App(SimpleHTTPRequestHandler):
     if p=='/api/orders':
       items=data.get('items',[]); customer=data.get('customer',{})
       if not items or not customer.get('name') or '@' not in str(customer.get('email','')): return api(self,422,{'error':'Add at least one item and complete your name and email.'})
-      total=sum(max(0,int(x.get('price_cents',0)))*max(1,min(99,int(x.get('quantity',1)))) for x in items)
-      if total<=0: return api(self,422,{'error':'Order total is invalid.'})
+      try: priced_items,total=price_order(items)
+      except (ValueError,TypeError): return api(self,422,{'error':'A product is unavailable or its quantity is invalid.'})
       ref='ORD-'+secrets.token_hex(4).upper(); c=conn()
       try:
-       c.execute('insert into orders(reference,email,name,company,phone,items_json,total_cents) values(?,?,?,?,?,?,?)',(ref,str(customer['email'])[:200],str(customer['name'])[:160],str(customer.get('company',''))[:200],str(customer.get('phone',''))[:80],json.dumps(items),total)); c.commit()
+       c.execute('insert into orders(reference,email,name,company,phone,items_json,total_cents) values(?,?,?,?,?,?,?)',(ref,str(customer['email'])[:200],str(customer['name'])[:160],str(customer.get('company',''))[:200],str(customer.get('phone',''))[:80],json.dumps(priced_items),total)); c.commit()
       except Exception: c.rollback(); return api(self,500,{'error':'We could not create this order. Please try again.'})
       finally: c.close()
       return api(self,201,{'reference':ref,'status':'pending_payment','message':'Order request received. Payment is not configured yet; our team will confirm next steps.'})
@@ -137,6 +161,13 @@ class App(SimpleHTTPRequestHandler):
       except Exception: c.rollback(); return api(self,500,{'error':'We could not save your request. Please try again.'})
       finally:c.close()
       return api(self,201,{'reference':ref,'message':'Request received. An engineer will review it.'})
+    if p=='/api/admin/orders/status':
+      if not self.guard(True): return
+      allowed={'pending_payment','confirmed','processing','shipped','cancelled'}; status=str(data.get('status',''))
+      if status not in allowed: return api(self,422,{'error':'Invalid order status.'})
+      c=conn(); result=c.execute('update orders set status=? where id=?',(status,int(data.get('id',0)))); c.commit(); c.close()
+      if not result.rowcount: return api(self,404,{'error':'Order not found.'})
+      return api(self,200,{'ok':True,'status':status})
     if p=='/api/admin/products':
       if not self.guard(True): return
       needed=['slug','model','title','description','category'];
