@@ -7,6 +7,10 @@ class AppTest(unittest.TestCase):
         c=app.conn(); self.assertGreater(c.execute('select count(*) from products').fetchone()[0],0)
         u=c.execute('select password from users').fetchone()[0]
         self.assertTrue(app.verify('change-this-before-production',u)); c.close()
+    def test_product_image_signature_validation(self):
+        self.assertTrue(app.valid_product_image('photo.png',b'\x89PNG\r\n\x1a\ncontent'))
+        self.assertFalse(app.valid_product_image('photo.png',b'<script>bad</script>'))
+        self.assertFalse(app.valid_product_image('photo.svg',b'<svg></svg>'))
     def test_order_shipping_fields_are_migrated(self):
         c=app.conn(); columns={row['name'] for row in c.execute('pragma table_info(orders)')}; c.close()
         self.assertTrue({'country','address_line1','city','postal_code','notes'} <= columns)

@@ -5,7 +5,7 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-ROOT=Path(__file__).resolve().parent; DATA=ROOT/'data'; DATA.mkdir(exist_ok=True); UPLOADS=DATA/'uploads'; UPLOADS.mkdir(exist_ok=True)
+ROOT=Path(__file__).resolve().parent; DATA=ROOT/'data'; DATA.mkdir(exist_ok=True); UPLOADS=DATA/'uploads'; UPLOADS.mkdir(exist_ok=True); MEDIA=DATA/'product-media'; MEDIA.mkdir(exist_ok=True)
 def env(name, default=''):
     # tiny .env loader without adding a runtime dependency
     return os.environ.get(name, default)
@@ -41,6 +41,9 @@ def price_order(items):
    priced.append({'slug':slug,'model':product['model'],'title':product['title'],'quantity':quantity,'unit_price_cents':product['price_cents']}); total+=product['price_cents']*quantity
  finally: c.close()
  return priced,total
+def valid_product_image(filename,data):
+ extension=Path(filename).suffix.lower(); signatures={'.jpg':data.startswith(b'\xff\xd8\xff'),'.jpeg':data.startswith(b'\xff\xd8\xff'),'.png':data.startswith(b'\x89PNG\r\n\x1a\n'),'.webp':data.startswith(b'RIFF') and data[8:12]==b'WEBP'}
+ return extension in signatures and signatures[extension]
 def conn():
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
 def hash_pw(p):
@@ -90,6 +93,10 @@ class App(SimpleHTTPRequestHandler):
   def do_GET(self):
     p=urlparse(self.path); q=parse_qs(p.query)
     if p.path=='/api/health': return api(self,200,{'status':'ready','database':'sqlite'})
+    if p.path.startswith('/media/products/'):
+      filename=p.path.rsplit('/',1)[1]; file_path=(MEDIA/filename).resolve()
+      if not filename or Path(filename).name!=filename or file_path.parent!=MEDIA.resolve() or not file_path.is_file(): return api(self,404,{'error':'Image not found.'})
+      raw=file_path.read_bytes(); self.send_response(200); self.send_header('Content-Type',mimetypes.guess_type(filename)[0] or 'application/octet-stream'); self.send_header('Content-Length',str(len(raw))); self.send_header('Cache-Control','public, max-age=31536000, immutable'); self.send_header('X-Content-Type-Options','nosniff'); self.end_headers(); self.wfile.write(raw); return
     if p.path=='/api/products':
       c=conn(); rows=[enrich_product(x) for x in c.execute('select * from products where published=1 order by model')]; c.close(); return api(self,200,{'products':rows})
     if p.path.startswith('/api/products/'):
@@ -154,9 +161,23 @@ class App(SimpleHTTPRequestHandler):
     except Exception: c.rollback(); return api(self,500,{'error':'We could not save your quote request. Please retry.'})
     finally: c.close()
     return api(self,201,{'reference':ref,'message':'Quote request received. An engineer will respond within one business day.'})
+  def product_image_upload(self):
+    if not self.guard(True): return
+    content_type=self.headers.get('Content-Type',''); length=int(self.headers.get('Content-Length','0') or 0)
+    if 'multipart/form-data' not in content_type: return api(self,415,{'error':'Use multipart form data.'})
+    if length>4*1024*1024+10000: return api(self,413,{'error':'Product image must be smaller than 4 MB.'})
+    boundary=content_type.split('boundary=',1)[-1].encode(); raw=self.rfile.read(length); upload=None
+    for part in raw.split(b'--'+boundary):
+     if b'filename="' not in part or b'\r\n\r\n' not in part: continue
+     head,value=part.split(b'\r\n\r\n',1); filename=head.decode('utf-8','ignore').split('filename="',1)[1].split('"',1)[0]; upload=(filename,value.rstrip(b'\r\n-')); break
+    if not upload or not upload[1]: return api(self,422,{'error':'Choose an image to upload.'})
+    extension=Path(upload[0]).suffix.lower()
+    if not valid_product_image(upload[0],upload[1]): return api(self,422,{'error':'Upload a valid JPG, PNG or WebP image.'})
+    stored=uuid.uuid4().hex+extension; (MEDIA/stored).write_bytes(upload[1]); return api(self,201,{'url':'/media/products/'+stored})
   def do_POST(self):
     p=urlparse(self.path).path
     if p=='/api/rfq': return self.rfq_multipart()
+    if p=='/api/admin/products/image': return self.product_image_upload()
     data=self.body()
     if p=='/api/orders':
       items=data.get('items',[]); customer=data.get('customer',{})
@@ -185,6 +206,13 @@ class App(SimpleHTTPRequestHandler):
       except Exception: c.rollback(); return api(self,500,{'error':'We could not save your request. Please try again.'})
       finally:c.close()
       return api(self,201,{'reference':ref,'message':'Request received. An engineer will review it.'})
+    if p=='/api/admin/inquiries/status':
+      if not self.guard(True): return
+      allowed={'queued','reviewing','quoted','closed'}; status=str(data.get('status',''))
+      if status not in allowed: return api(self,422,{'error':'Invalid inquiry status.'})
+      c=conn(); result=c.execute('update inquiries set state=? where id=?',(status,int(data.get('id',0)))); c.commit(); c.close()
+      if not result.rowcount: return api(self,404,{'error':'Inquiry not found.'})
+      return api(self,200,{'ok':True,'status':status})
     if p=='/api/admin/orders/status':
       if not self.guard(True): return
       allowed={'pending_payment','confirmed','processing','shipped','cancelled'}; status=str(data.get('status',''))
@@ -200,7 +228,7 @@ class App(SimpleHTTPRequestHandler):
       except (ValueError,TypeError): return api(self,422,{'error':'Price and inventory must be valid numbers.'})
       if price_cents<0 or inventory<0: return api(self,422,{'error':'Price and inventory cannot be negative.'})
       image_url=str(data.get('image_url','')).strip(); parsed=urlparse(image_url) if image_url else None
-      if image_url and (parsed.scheme!='https' or not parsed.netloc): return api(self,422,{'error':'Product image must use a valid HTTPS URL.'})
+      if image_url and not image_url.startswith('/media/products/') and (parsed.scheme!='https' or not parsed.netloc): return api(self,422,{'error':'Product image must be an uploaded image or valid HTTPS URL.'})
       values=(str(data['slug']).strip().lower()[:120],str(data['model']).strip()[:120],str(data['title']).strip()[:200],str(data['description']).strip()[:2000],str(data['category']).strip()[:100],str(data.get('range_text','Configuration dependent')).strip()[:200],str(data.get('interface','On request')).strip()[:200],str(data.get('rating','On request')).strip()[:100],int(bool(data.get('published'))),price_cents,inventory,str(data['sku']).strip()[:120],image_url)
       c=conn()
       try:
