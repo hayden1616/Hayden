@@ -30,14 +30,16 @@ COMMERCE={
  'int-620':{'price_cents':21900,'inventory':21,'sku':'INT-620-STD'}
 }
 def enrich_product(row):
- d=dict(row); d.update(COMMERCE.get(d['slug'],{'price_cents':0,'inventory':0,'sku':d['model']})); d['currency']='USD'; return d
+ d=dict(row); d['currency']=d.get('currency') or 'USD'; d['sku']=d.get('sku') or d['model']; d['image_url']=d.get('image_url') or ''; return d
 def price_order(items):
  if not isinstance(items,list) or not items: raise ValueError('Add at least one item.')
- priced=[]; total=0
- for item in items:
-  slug=str(item.get('slug','')); product=COMMERCE.get(slug); quantity=max(1,min(99,int(item.get('quantity',1))))
-  if not product or quantity>product['inventory']: raise ValueError('A product is unavailable or exceeds available quantity.')
-  priced.append({'slug':slug,'model':product['sku'].removesuffix('-STD'),'title':product['sku'],'quantity':quantity,'unit_price_cents':product['price_cents']}); total+=product['price_cents']*quantity
+ priced=[]; total=0; c=conn()
+ try:
+  for item in items:
+   slug=str(item.get('slug','')); quantity=max(1,min(99,int(item.get('quantity',1)))); product=c.execute('select slug,model,title,price_cents,inventory from products where slug=? and published=1',(slug,)).fetchone()
+   if not product or product['price_cents']<=0 or quantity>product['inventory']: raise ValueError('A product is unavailable or exceeds available quantity.')
+   priced.append({'slug':slug,'model':product['model'],'title':product['title'],'quantity':quantity,'unit_price_cents':product['price_cents']}); total+=product['price_cents']*quantity
+ finally: c.close()
  return priced,total
 def conn():
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
@@ -49,6 +51,12 @@ def init():
     c=conn(); c.executescript('''CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL); CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY,slug TEXT UNIQUE,model TEXT,title TEXT,description TEXT,category TEXT,range_text TEXT,interface TEXT,rating TEXT,published INTEGER DEFAULT 1,updated_at TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS inquiries(id INTEGER PRIMARY KEY,reference TEXT UNIQUE,name TEXT,email TEXT,company TEXT,phone TEXT,product TEXT,message TEXT,consent INTEGER,ip_hash TEXT,state TEXT DEFAULT 'queued',created_at TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY,inquiry_id INTEGER UNIQUE,state TEXT DEFAULT 'queued',attempts INTEGER DEFAULT 0,created_at TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY,reference TEXT UNIQUE,email TEXT,name TEXT,company TEXT,phone TEXT,items_json TEXT,total_cents INTEGER,currency TEXT DEFAULT 'USD',status TEXT DEFAULT 'pending_payment',created_at TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS rfq_attachments(id INTEGER PRIMARY KEY,inquiry_id INTEGER,filename TEXT,stored_name TEXT,content_type TEXT,size INTEGER); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT,updated_at TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,event TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP);''')
     if not c.execute('select 1 from users').fetchone(): c.execute('insert into users(email,password,role) values(?,?,?)',(env('ADMIN_EMAIL','admin@example.com'),hash_pw(env('ADMIN_PASSWORD','change-this-before-production')),'admin'))
     if not c.execute('select 1 from products').fetchone(): c.executemany('insert into products(slug,model,title,description,category,range_text,interface,rating) values(?,?,?,?,?,?,?,?)',PRODUCTS)
+    columns={row['name'] for row in c.execute('pragma table_info(products)')}; added='price_cents' not in columns
+    for name,definition in [('price_cents','INTEGER NOT NULL DEFAULT 0'),('inventory','INTEGER NOT NULL DEFAULT 0'),('sku','TEXT'),('currency',"TEXT NOT NULL DEFAULT 'USD'"),('image_url',"TEXT NOT NULL DEFAULT ''")]:
+     if name not in columns: c.execute(f'alter table products add column {name} {definition}')
+    if added:
+     for slug,meta in COMMERCE.items(): c.execute("update products set price_cents=?,inventory=?,sku=?,currency='USD' where slug=?",(meta['price_cents'],meta['inventory'],meta['sku'],slug))
+    c.execute('create unique index if not exists idx_products_sku on products(sku) where sku is not null')
     c.commit(); c.close()
 init()
 def sign(v): return base64.urlsafe_b64encode(hmac.new(SECRET,v.encode(),hashlib.sha256).digest()).decode().rstrip('=')
@@ -57,7 +65,8 @@ def session(handler):
     if not item: return None
     try:
       value,sig=item.value.rsplit('.',1)
-      if hmac.compare_digest(sign(value),sig): return json.loads(base64.urlsafe_b64decode(value+'==='))
+      if hmac.compare_digest(sign(value),sig):
+       data=json.loads(base64.urlsafe_b64decode(value+'===')); return data if data.get('exp',0)>int(time.time()) else None
     except Exception: pass
     return None
 def api(handler,status,payload,headers=None):
@@ -170,9 +179,24 @@ class App(SimpleHTTPRequestHandler):
       return api(self,200,{'ok':True,'status':status})
     if p=='/api/admin/products':
       if not self.guard(True): return
-      needed=['slug','model','title','description','category'];
-      if any(not str(data.get(k,'')).strip() for k in needed): return api(self,422,{'error':'Complete the required product fields.'})
-      c=conn(); c.execute('insert into products(slug,model,title,description,category,range_text,interface,rating,published) values(?,?,?,?,?,?,?,?,?)',(data['slug'],data['model'],data['title'],data['description'],data['category'],data.get('range_text','Configuration dependent'),data.get('interface','On request'),data.get('rating','On request'),int(bool(data.get('published',True))))); c.commit(); c.close(); return api(self,201,{'ok':True})
+      needed=['slug','model','title','description','category','sku'];
+      if any(not str(data.get(k,'')).strip() for k in needed): return api(self,422,{'error':'Complete all required product fields.'})
+      try: price_cents=round(float(data.get('price',0))*100); inventory=int(data.get('inventory',0))
+      except (ValueError,TypeError): return api(self,422,{'error':'Price and inventory must be valid numbers.'})
+      if price_cents<0 or inventory<0: return api(self,422,{'error':'Price and inventory cannot be negative.'})
+      image_url=str(data.get('image_url','')).strip(); parsed=urlparse(image_url) if image_url else None
+      if image_url and (parsed.scheme!='https' or not parsed.netloc): return api(self,422,{'error':'Product image must use a valid HTTPS URL.'})
+      values=(str(data['slug']).strip().lower()[:120],str(data['model']).strip()[:120],str(data['title']).strip()[:200],str(data['description']).strip()[:2000],str(data['category']).strip()[:100],str(data.get('range_text','Configuration dependent')).strip()[:200],str(data.get('interface','On request')).strip()[:200],str(data.get('rating','On request')).strip()[:100],int(bool(data.get('published'))),price_cents,inventory,str(data['sku']).strip()[:120],image_url)
+      c=conn()
+      try:
+       product_id=int(data.get('id',0) or 0)
+       if product_id: result=c.execute('update products set slug=?,model=?,title=?,description=?,category=?,range_text=?,interface=?,rating=?,published=?,price_cents=?,inventory=?,sku=?,image_url=?,updated_at=CURRENT_TIMESTAMP where id=?',values+(product_id,))
+       else: result=c.execute('insert into products(slug,model,title,description,category,range_text,interface,rating,published,price_cents,inventory,sku,image_url) values(?,?,?,?,?,?,?,?,?,?,?,?,?)',values)
+       c.commit()
+      except sqlite3.IntegrityError: c.rollback(); return api(self,409,{'error':'Slug or SKU already exists.'})
+      finally: c.close()
+      if product_id and not result.rowcount: return api(self,404,{'error':'Product not found.'})
+      return api(self,200 if product_id else 201,{'ok':True,'id':product_id or result.lastrowid})
     if p=='/api/admin/delivery':
       if not self.guard(True): return
       endpoint=str(data.get('endpoint','')).strip(); u=urlparse(endpoint)

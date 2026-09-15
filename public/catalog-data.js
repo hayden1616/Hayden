@@ -11,7 +11,7 @@ window.CatalogData={
     const data=await response.json();
     return data.products.map((product,index)=>({...product,
       price_label:new Intl.NumberFormat("en-US",{style:"currency",currency:product.currency}).format(product.price_cents/100),
-      image:this.images[index%this.images.length],
+      image:product.image_url||this.images[index%this.images.length],
       intro:"Built for repeatable field performance, with configuration support for installation, signal and documentation requirements."
     }));
   },
